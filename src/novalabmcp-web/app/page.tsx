@@ -62,6 +62,14 @@ type ActivityEvent = {
   resultSummary: string;
   errorCode?: string;
 };
+type McpCapability = "readonly" | "readwrite";
+type McpTool = { name: string; description?: string };
+type McpPreset = {
+  id: string;
+  label: string;
+  tool: string;
+  arguments: Record<string, unknown>;
+};
 
 const API =
   process.env.NEXT_PUBLIC_API_URL ??
@@ -109,6 +117,93 @@ const SCENARIOS: Record<
     ],
   },
 };
+const MCP_PRESETS: Record<ScenarioId, Record<McpCapability, McpPreset[]>> = {
+  itsm: {
+    readonly: [
+      {
+        id: "tickets",
+        label: "List recent tickets",
+        tool: "readonly_itsm_list_tickets",
+        arguments: { page: 1, pageSize: 10 },
+      },
+      {
+        id: "dashboard",
+        label: "Get service desk dashboard",
+        tool: "readonly_itsm_get_dashboard",
+        arguments: {},
+      },
+    ],
+    readwrite: [
+      {
+        id: "create-ticket",
+        label: "Create a sample ticket",
+        tool: "readwrite_itsm_create_ticket",
+        arguments: {
+          ticket: {
+            title: "MCP editor sample ticket",
+            description: "Created from the MCP query editor.",
+            status: "New",
+            priority: "P3",
+            requesterId: "itsm-employees-001",
+          },
+        },
+      },
+    ],
+  },
+  crm: {
+    readonly: [
+      {
+        id: "accounts",
+        label: "List accounts",
+        tool: "readonly_crm_list_accounts",
+        arguments: { page: 1, pageSize: 10 },
+      },
+      {
+        id: "pipeline",
+        label: "Get pipeline summary",
+        tool: "readonly_crm_get_pipeline_summary",
+        arguments: {},
+      },
+    ],
+    readwrite: [
+      {
+        id: "create-lead",
+        label: "Create a sample lead",
+        tool: "readwrite_crm_create_lead",
+        arguments: { lead: { name: "MCP editor sample lead" } },
+      },
+    ],
+  },
+  projects: {
+    readonly: [
+      {
+        id: "projects",
+        label: "List projects",
+        tool: "readonly_pm_list_projects",
+        arguments: { page: 1, pageSize: 10 },
+      },
+      {
+        id: "portfolio",
+        label: "Get portfolio summary",
+        tool: "readonly_pm_get_portfolio_summary",
+        arguments: {},
+      },
+    ],
+    readwrite: [
+      {
+        id: "create-task",
+        label: "Create a sample task",
+        tool: "readwrite_pm_create_task",
+        arguments: {
+          task: {
+            name: "MCP editor sample task",
+            projectId: "projects-projects-001",
+          },
+        },
+      },
+    ],
+  },
+};
 
 const entityLabels: Record<string, string> = {
   "sales-teams": "Sales teams",
@@ -138,6 +233,42 @@ function recordTitle(record: RecordData | null) {
   return valueText(
     record.title ?? record.name ?? record.ticketNumber ?? record.id,
   );
+}
+
+async function mcpJsonRpc(
+  endpoint: string,
+  payload: Record<string, unknown>,
+  headers: Record<string, string>,
+) {
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      ...headers,
+      Accept: "application/json, text/event-stream",
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) throw new Error(await responseMessage(response));
+
+  const text = await response.text();
+  let message: {
+    result?: { tools?: McpTool[] };
+    error?: { message?: string };
+  };
+  try {
+    message = JSON.parse(text);
+  } catch {
+    const data = text
+      .split("\n")
+      .find((line) => line.startsWith("data: "))
+      ?.slice(6);
+    if (!data) throw new Error("The MCP server returned an invalid response.");
+    message = JSON.parse(data);
+  }
+  if (message.error) {
+    throw new Error(message.error.message ?? "The MCP request failed.");
+  }
+  return message;
 }
 
 async function responseMessage(response: Response) {
@@ -195,12 +326,29 @@ export default function Home() {
   const [activityCapability, setActivityCapability] = useState("");
   const [activityOutcome, setActivityOutcome] = useState("");
   const [activityQuery, setActivityQuery] = useState("");
+  const [mcpCapability, setMcpCapability] = useState<McpCapability>("readonly");
+  const [mcpTools, setMcpTools] = useState<McpTool[]>([]);
+  const [mcpTool, setMcpTool] = useState("");
+  const [mcpPreset, setMcpPreset] = useState("");
+  const [mcpArguments, setMcpArguments] = useState("{}");
+  const [mcpResult, setMcpResult] = useState("");
+  const [mcpLoading, setMcpLoading] = useState(false);
+  const [mcpError, setMcpError] = useState("");
   const [hideSuccesses, setHideSuccesses] = useState(false);
   const [paused, setPaused] = useState(false);
   const [streamStatus, setStreamStatus] = useState("Connecting");
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const abortStream = useRef<AbortController | null>(null);
   const isActivity = entity === "mcp-activity";
+  const isMcpEditor = entity === "mcp-editor";
+  const mcpEndpoint = API
+    ? `${API}/mcp/${mcpCapability}/${scenario}`
+    : `/api/mcp/${mcpCapability}/${scenario}`;
+  const mcpPresets = MCP_PRESETS[scenario][mcpCapability];
+  const displayedMcpPreset =
+    mcpPresets.find((preset) => preset.id === mcpPreset)?.id ??
+    mcpPresets[0]?.id ??
+    "";
   const canAdmin = entraEnabled
     ? entraRoles.includes("DemoAdmin")
     : role === "DemoAdmin";
@@ -229,7 +377,8 @@ export default function Home() {
   }, [query]);
 
   const loadRecords = useCallback(async () => {
-    if (isActivity || (entraEnabled && (!authReady || !account))) return;
+    if (isActivity || isMcpEditor || (entraEnabled && (!authReady || !account)))
+      return;
     setLoading(true);
     setError("");
     const parameters = new URLSearchParams({
@@ -276,6 +425,7 @@ export default function Home() {
     entraEnabled,
     getRequestHeaders,
     isActivity,
+    isMcpEditor,
     pageModel,
     scenario,
     sortModel,
@@ -287,7 +437,65 @@ export default function Home() {
   }, [loadRecords]);
 
   useEffect(() => {
-    setEntity(SCENARIOS[scenario].entities[0]);
+    const preset = MCP_PRESETS[scenario][mcpCapability][0];
+    setMcpPreset(preset.id);
+    setMcpTool(preset.tool);
+    setMcpArguments(JSON.stringify(preset.arguments, null, 2));
+    setMcpResult("");
+    setMcpError("");
+  }, [mcpCapability, scenario]);
+
+  useEffect(() => {
+    if (!isMcpEditor || (entraEnabled && (!authReady || !account))) return;
+    let active = true;
+    async function loadTools() {
+      setMcpLoading(true);
+      setMcpError("");
+      try {
+        const message = await mcpJsonRpc(
+          mcpEndpoint,
+          { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} },
+          await getRequestHeaders(),
+        );
+        if (active) {
+          const tools = message.result?.tools ?? [];
+          setMcpTools(tools);
+          setMcpTool((current) =>
+            tools.some((tool) => tool.name === current)
+              ? current
+              : (tools[0]?.name ?? ""),
+          );
+        }
+      } catch (reason) {
+        if (active) {
+          setMcpTools([]);
+          setMcpError(
+            reason instanceof Error
+              ? reason.message
+              : "The MCP tool catalog could not be loaded.",
+          );
+        }
+      } finally {
+        if (active) setMcpLoading(false);
+      }
+    }
+    void loadTools();
+    return () => {
+      active = false;
+    };
+  }, [
+    account,
+    authReady,
+    entraEnabled,
+    getRequestHeaders,
+    isMcpEditor,
+    mcpEndpoint,
+  ]);
+
+  useEffect(() => {
+    setEntity((current) =>
+      current === "mcp-editor" ? current : SCENARIOS[scenario].entities[0],
+    );
     setPageModel({ page: 0, pageSize: 10 });
     setSortModel([]);
     setStatusFilter("");
@@ -523,6 +731,35 @@ export default function Home() {
     setSuccess("Event JSON copied.");
   }
 
+  async function runMcpQuery() {
+    setMcpLoading(true);
+    setMcpError("");
+    setMcpResult("");
+    try {
+      const args = JSON.parse(mcpArguments) as unknown;
+      if (!args || typeof args !== "object" || Array.isArray(args)) {
+        throw new Error("Tool arguments must be a JSON object.");
+      }
+      const message = await mcpJsonRpc(
+        mcpEndpoint,
+        {
+          jsonrpc: "2.0",
+          id: Date.now(),
+          method: "tools/call",
+          params: { name: mcpTool, arguments: args },
+        },
+        await getRequestHeaders(),
+      );
+      setMcpResult(JSON.stringify(message.result ?? message, null, 2));
+    } catch (reason) {
+      setMcpError(
+        reason instanceof Error ? reason.message : "The MCP call failed.",
+      );
+    } finally {
+      setMcpLoading(false);
+    }
+  }
+
   const drawer = (
     <Box
       sx={{
@@ -623,6 +860,17 @@ export default function Home() {
         sx={{ justifyContent: "flex-start", px: 1.5 }}
       >
         MCP Command Center
+      </Button>
+      <Button
+        onClick={() => {
+          setEntity("mcp-editor");
+          setMobileNavOpen(false);
+        }}
+        variant={isMcpEditor ? "contained" : "text"}
+        color={isMcpEditor ? "primary" : "inherit"}
+        sx={{ justifyContent: "flex-start", px: 1.5 }}
+      >
+        MCP Editor
       </Button>
       <Box sx={{ mt: 2, p: 1.5, bgcolor: "action.hover", borderRadius: 2 }}>
         <Typography variant="caption" sx={{ fontWeight: 700 }}>
@@ -764,28 +1012,187 @@ export default function Home() {
           >
             <Box>
               <Typography variant="h4">
-                {isActivity ? "MCP Command Center" : label(entity)}
+                {isActivity
+                  ? "MCP Command Center"
+                  : isMcpEditor
+                    ? "MCP Editor"
+                    : label(entity)}
               </Typography>
               <Typography color="text.secondary" sx={{ mt: 0.5 }}>
                 {isActivity
                   ? "Inspect live, bounded MCP activity across all three domains."
-                  : `Browse and manage ${label(entity).toLowerCase()} in ${SCENARIOS[scenario].caption}.`}
+                  : isMcpEditor
+                    ? "Discover tools and run prebuilt or custom MCP queries across all three domains."
+                    : `Browse and manage ${label(entity).toLowerCase()} in ${SCENARIOS[scenario].caption}.`}
               </Typography>
             </Box>
-            {!isActivity && canWrite && (
+            {!isActivity && !isMcpEditor && canWrite && (
               <Button variant="contained" onClick={openCreate}>
                 Create {label(entity).replace(/s$/, "")}
               </Button>
             )}
           </Stack>
 
-          <Alert severity="info" icon={false} sx={{ mb: 3 }}>
-            <strong>In-memory demo data</strong> — resets when the service
-            restarts. Each scenario is isolated; changes made in this browser do
-            not create MCP command events.
-          </Alert>
+          {!isActivity && !isMcpEditor && (
+            <Alert severity="info" icon={false} sx={{ mb: 3 }}>
+              <strong>In-memory demo data</strong> — resets when the service
+              restarts. Each scenario is isolated; changes made in this browser
+              do not create MCP command events.
+            </Alert>
+          )}
 
-          {isActivity ? (
+          {isMcpEditor ? (
+            <Card variant="outlined">
+              <CardContent>
+                <Stack spacing={2}>
+                  <Stack direction={{ xs: "column", sm: "row" }} spacing={2}>
+                    <FormControl fullWidth size="small">
+                      <InputLabel id="mcp-capability-label">
+                        Capability
+                      </InputLabel>
+                      <Select
+                        labelId="mcp-capability-label"
+                        label="Capability"
+                        value={mcpCapability}
+                        onChange={(event) =>
+                          setMcpCapability(event.target.value as McpCapability)
+                        }
+                      >
+                        <MenuItem value="readonly">READONLY</MenuItem>
+                        <MenuItem value="readwrite">READWRITE</MenuItem>
+                      </Select>
+                    </FormControl>
+                    <FormControl fullWidth size="small">
+                      <InputLabel id="mcp-scenario-label">Area</InputLabel>
+                      <Select
+                        labelId="mcp-scenario-label"
+                        label="Area"
+                        value={scenario}
+                        onChange={(event) =>
+                          setScenario(event.target.value as ScenarioId)
+                        }
+                      >
+                        {Object.entries(SCENARIOS).map(([id, value]) => (
+                          <MenuItem key={id} value={id}>
+                            {value.label}
+                          </MenuItem>
+                        ))}
+                      </Select>
+                    </FormControl>
+                    <FormControl fullWidth size="small">
+                      <InputLabel id="mcp-preset-label">
+                        Prebuilt query
+                      </InputLabel>
+                      <Select
+                        labelId="mcp-preset-label"
+                        label="Prebuilt query"
+                        value={displayedMcpPreset}
+                        onChange={(event) => {
+                          const preset = mcpPresets.find(
+                            (item) => item.id === event.target.value,
+                          );
+                          if (!preset) return;
+                          setMcpPreset(preset.id);
+                          setMcpTool(preset.tool);
+                          setMcpArguments(
+                            JSON.stringify(preset.arguments, null, 2),
+                          );
+                        }}
+                      >
+                        {mcpPresets.map((preset) => (
+                          <MenuItem key={preset.id} value={preset.id}>
+                            {preset.label}
+                          </MenuItem>
+                        ))}
+                      </Select>
+                    </FormControl>
+                  </Stack>
+                  <FormControl fullWidth size="small">
+                    <InputLabel id="mcp-tool-label">MCP tool</InputLabel>
+                    <Select
+                      labelId="mcp-tool-label"
+                      label="MCP tool"
+                      value={mcpTool}
+                      onChange={(event) => setMcpTool(event.target.value)}
+                      disabled={mcpLoading || mcpTools.length === 0}
+                    >
+                      {mcpTool &&
+                        !mcpTools.some((tool) => tool.name === mcpTool) && (
+                          <MenuItem value={mcpTool}>{mcpTool}</MenuItem>
+                        )}
+                      {mcpTools.map((tool) => (
+                        <MenuItem key={tool.name} value={tool.name}>
+                          {tool.name}
+                        </MenuItem>
+                      ))}
+                    </Select>
+                  </FormControl>
+                  <Typography variant="caption" color="text.secondary">
+                    {mcpTools.find((tool) => tool.name === mcpTool)
+                      ?.description ??
+                      "Loading tools from the selected MCP endpoint."}
+                  </Typography>
+                  {mcpCapability === "readwrite" && (
+                    <Alert severity="warning">
+                      READWRITE calls can change the in-memory demo data. The
+                      sample query creates a new record.
+                    </Alert>
+                  )}
+                  {mcpError && <Alert severity="error">{mcpError}</Alert>}
+                  <TextField
+                    fullWidth
+                    multiline
+                    minRows={9}
+                    label="Tool arguments (JSON)"
+                    value={mcpArguments}
+                    onChange={(event) => setMcpArguments(event.target.value)}
+                    slotProps={{
+                      htmlInput: {
+                        spellCheck: false,
+                        "aria-label": "MCP tool arguments JSON",
+                      },
+                    }}
+                  />
+                  <Stack
+                    direction="row"
+                    spacing={1}
+                    sx={{ alignItems: "center" }}
+                  >
+                    <Button
+                      variant="contained"
+                      onClick={() => void runMcpQuery()}
+                      disabled={mcpLoading || !mcpTool}
+                    >
+                      {mcpLoading ? "Running…" : "Run query"}
+                    </Button>
+                    {mcpLoading && <CircularProgress size={18} />}
+                  </Stack>
+                  {mcpResult && (
+                    <Box>
+                      <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                        MCP response
+                      </Typography>
+                      <Box
+                        component="pre"
+                        sx={{
+                          whiteSpace: "pre-wrap",
+                          overflowWrap: "anywhere",
+                          p: 2,
+                          m: 0,
+                          bgcolor: "action.hover",
+                          borderRadius: 2,
+                          maxHeight: 480,
+                          overflow: "auto",
+                        }}
+                      >
+                        {mcpResult}
+                      </Box>
+                    </Box>
+                  )}
+                </Stack>
+              </CardContent>
+            </Card>
+          ) : isActivity ? (
             <Card variant="outlined">
               <CardContent>
                 <Stack
@@ -1135,7 +1542,13 @@ export default function Home() {
               <Select
                 labelId="mobile-entity"
                 label="Navigate entities"
-                value={isActivity ? "mcp-activity" : entity}
+                value={
+                  isActivity
+                    ? "mcp-activity"
+                    : isMcpEditor
+                      ? "mcp-editor"
+                      : entity
+                }
                 onChange={(event) => setEntity(event.target.value)}
               >
                 {SCENARIOS[scenario].entities.map((item) => (
@@ -1144,6 +1557,7 @@ export default function Home() {
                   </MenuItem>
                 ))}
                 <MenuItem value="mcp-activity">MCP Command Center</MenuItem>
+                <MenuItem value="mcp-editor">MCP Editor</MenuItem>
               </Select>
             </FormControl>
           </Box>

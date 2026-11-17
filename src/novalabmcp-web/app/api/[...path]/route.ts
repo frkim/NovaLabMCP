@@ -12,9 +12,26 @@ async function forward(request: Request, context: RouteContext) {
   }
 
   const { path } = await context.params;
+  const isMcpRequest = path[0] === "mcp";
+  if (
+    isMcpRequest &&
+    (request.method !== "POST" ||
+      path.length !== 3 ||
+      !["readonly", "readwrite"].includes(path[1]) ||
+      !["itsm", "crm", "projects"].includes(path[2]))
+  ) {
+    return Response.json(
+      { title: "The MCP endpoint was not found." },
+      { status: 404 },
+    );
+  }
+
   const incoming = new URL(request.url);
+  const destinationPath = isMcpRequest
+    ? `mcp/${path.slice(1).map(encodeURIComponent).join("/")}`
+    : `api/${path.map(encodeURIComponent).join("/")}`;
   const destination = new URL(
-    `${target.replace(/\/+$/, "")}/api/${path.map(encodeURIComponent).join("/")}`,
+    `${target.replace(/\/+$/, "")}/${destinationPath}`,
   );
   destination.search = incoming.search;
 
