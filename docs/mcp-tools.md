@@ -33,6 +33,21 @@ Local Development may set `X-Demo-Role`; production ignores demo headers and
 requires a bearer token with the configured Entra audience and role claim.
 High-impact operations require an explicit `confirm` argument.
 
+READONLY endpoints also expose a domain glossary through `resources/list` and
+`resources/read`, plus three analysis prompts through `prompts/list` and
+`prompts/get`:
+
+- ITSM: `novalabmcp://itsm/glossary`, `daily_incident_review`,
+  `analyze_major_incident`, `team_workload_summary`.
+- CRM: `novalabmcp://crm/glossary`, `weekly_pipeline_review`,
+  `opportunity_risk_review`, `prepare_account_briefing`.
+- Projects: `novalabmcp://projects/glossary`, `portfolio_health_review`,
+  `project_risk_assessment`, `weekly_status_report`.
+
+Prompts direct clients to use READONLY tools for investigation; they do not
+authorize or perform mutations. READWRITE endpoints do not register resources
+or prompts.
+
 ## Local test
 
 Start the API in Development, then list the ITSM read-only tools:

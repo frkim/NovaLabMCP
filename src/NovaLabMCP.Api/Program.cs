@@ -354,9 +354,25 @@ static void MapMcpEndpoint<TTools>(WebApplication app, string path, ScenarioStor
     var mcpBuilder = WebApplication.CreateBuilder();
     mcpBuilder.Services.AddSingleton(store);
     mcpBuilder.Services.AddSingleton(activity);
-    mcpBuilder.Services.AddMcpServer()
+    var serverBuilder = mcpBuilder.Services.AddMcpServer()
         .WithHttpTransport(options => options.SessionMode = HttpServerSessionMode.Stateless)
         .WithTools<TTools>();
+    if (path.StartsWith("/mcp/readonly/", StringComparison.Ordinal))
+    {
+        switch (path)
+        {
+            case "/mcp/readonly/itsm":
+                serverBuilder.WithResources<ItsmResources>().WithPrompts<ItsmPrompts>();
+                break;
+            case "/mcp/readonly/crm":
+                serverBuilder.WithResources<CrmResources>().WithPrompts<CrmPrompts>();
+                break;
+            case "/mcp/readonly/projects":
+                serverBuilder.WithResources<ProjectResources>().WithPrompts<ProjectPrompts>();
+                break;
+        }
+    }
+
     var mcpApp = mcpBuilder.Build();
     mcpApp.UseRouting();
 #pragma warning disable ASP0014
