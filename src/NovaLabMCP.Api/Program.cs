@@ -37,10 +37,15 @@ if (!demoAuthEnabled)
             options.Authority = authority;
             options.Audience = audience;
             options.RequireHttpsMetadata = true;
-            options.TokenValidationParameters = new TokenValidationParameters { RoleClaimType = "roles" };
+            options.MapInboundClaims = false;
+            options.TokenValidationParameters = new TokenValidationParameters
+            {
+                NameClaimType = "name",
+                RoleClaimType = "roles"
+            };
         });
-    builder.Services.AddAuthorization();
 }
+builder.Services.AddAuthorization();
 
 var store = new ScenarioStore();
 var activity = new McpActivityBuffer(builder.Configuration.GetValue("NOVALABMCP_MCP_LOG_CAPACITY", 2000));
@@ -51,12 +56,16 @@ var app = builder.Build();
 if (!app.Environment.IsDevelopment())
 {
     app.UseHsts();
-    app.UseHttpsRedirection();
-    app.UseAuthentication();
-    app.UseAuthorization();
 }
 
+app.UseRouting();
 app.UseCors();
+if (!demoAuthEnabled)
+{
+    app.UseAuthentication();
+}
+app.UseAuthorization();
+
 app.Use(async (context, next) =>
 {
     context.Response.Headers["X-Content-Type-Options"] = "nosniff";
@@ -349,7 +358,10 @@ static void MapMcpEndpoint<TTools>(WebApplication app, string path, ScenarioStor
         .WithHttpTransport(options => options.SessionMode = HttpServerSessionMode.Stateless)
         .WithTools<TTools>();
     var mcpApp = mcpBuilder.Build();
-    mcpApp.MapMcp();
+    mcpApp.UseRouting();
+#pragma warning disable ASP0014
+    mcpApp.UseEndpoints(endpoints => endpoints.MapMcp());
+#pragma warning restore ASP0014
     var pipeline = ((IApplicationBuilder)mcpApp).Build();
 
     app.Map(path, branch => branch.Run(async context =>

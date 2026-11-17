@@ -1,0 +1,184 @@
+name: Validate and deploy
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: Deploy the validated commit to the protected production environment
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: novalabmcp-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: 10.0.x
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: src/novalabmcp-web/.nvmrc
+          cache: npm
+          cache-dependency-path: src/novalabmcp-web/package-lock.json
+      - name: Restore, build, and test .NET
+        run: |
+          dotnet restore NovaLabMCP.sln
+          dotnet build NovaLabMCP.sln --no-restore --configuration Release
+          dotnet test NovaLabMCP.sln --no-build --configuration Release
+      - name: Smoke-test REST and MCP against all scenarios
+        run: |
+          set -euo pipefail
+          ASPNETCORE_ENVIRONMENT=Development \
+            ASPNETCORE_URLS=http://localhost:5290 \
+            dotnet run --no-build --configuration Release --no-launch-profile \
+              --project src/NovaLabMCP.Api > /tmp/novalabmcp-api.log 2>&1 &
+          api_pid=$!
+          trap 'kill "$api_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --silent --fail http://localhost:5290/health/live >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          bash tests/smoke-test.sh
+      - name: Lint, type-check, audit, and build frontend
+        working-directory: src/novalabmcp-web
+        env:
+          NEXT_PUBLIC_API_URL: https://api.example.invalid
+        run: |
+          npm ci
+          npm run lint
+          npm run typecheck
+          npm audit
+          npm run build
+      - name: Validate Bicep
+        run: |
+          az bicep install
+          az bicep build --file infra/bicep/main.bicep --outfile /tmp/novalabmcp-main.json
+
+  build-images:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build API image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: src/NovaLabMCP.Api/Dockerfile
+          tags: novalabmcp-api:validation
+      - name: Build web image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: src/novalabmcp-web
+          file: src/novalabmcp-web/Dockerfile
+          tags: novalabmcp-web:validation
+
+  deploy:
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy == true && github.ref == 'refs/heads/main'
+    needs:
+      - validate
+      - build-images
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: novalabmcp-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Sign in to Azure with OIDC
+        uses: Azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Build and push immutable images
+        id: images
+        env:
+          REGISTRY_NAME: ${{ vars.NOVALABMCP_REGISTRY_NAME }}
+          CLIENT_ID: ${{ vars.ENTRA_CLIENT_ID }}
+          TENANT_ID: ${{ vars.ENTRA_TENANT_ID }}
+          API_SCOPE: ${{ vars.ENTRA_API_SCOPE }}
+        run: |
+          set -euo pipefail
+          login_server="$(az acr show --name "$REGISTRY_NAME" --query loginServer --output tsv)"
+          az acr login --name "$REGISTRY_NAME"
+          api_tag="${login_server}/novalabmcp-api:${GITHUB_SHA}"
+          web_tag="${login_server}/novalabmcp-web:${GITHUB_SHA}"
+          docker buildx build --push --file src/NovaLabMCP.Api/Dockerfile --tag "$api_tag" .
+          docker buildx build --push \
+            --file src/novalabmcp-web/Dockerfile \
+            --build-arg "NEXT_PUBLIC_ENTRA_CLIENT_ID=${CLIENT_ID}" \
+            --build-arg "NEXT_PUBLIC_ENTRA_TENANT_ID=${TENANT_ID}" \
+            --build-arg "NEXT_PUBLIC_ENTRA_API_SCOPE=${API_SCOPE}" \
+            --tag "$web_tag" src/novalabmcp-web
+          api_digest="$(az acr repository show --name "$REGISTRY_NAME" --image "novalabmcp-api:${GITHUB_SHA}" --query digest --output tsv)"
+          web_digest="$(az acr repository show --name "$REGISTRY_NAME" --image "novalabmcp-web:${GITHUB_SHA}" --query digest --output tsv)"
+          echo "api_image=${login_server}/novalabmcp-api@${api_digest}" >> "$GITHUB_OUTPUT"
+          echo "web_image=${login_server}/novalabmcp-web@${web_digest}" >> "$GITHUB_OUTPUT"
+      - name: Deploy single-revision Container Apps
+        env:
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          ENVIRONMENT_NAME: ${{ vars.NOVALABMCP_ENVIRONMENT_NAME }}
+          REGISTRY_NAME: ${{ vars.NOVALABMCP_REGISTRY_NAME }}
+          FRONTEND_ORIGIN: ${{ vars.NOVALABMCP_FRONTEND_ORIGIN }}
+          AUTHORITY: ${{ vars.NOVALABMCP_AUTHORITY }}
+          AUDIENCE: ${{ vars.ENTRA_API_AUDIENCE }}
+          API_IMAGE: ${{ steps.images.outputs.api_image }}
+          WEB_IMAGE: ${{ steps.images.outputs.web_image }}
+        run: |
+          set -euo pipefail
+          az deployment group create \
+            --resource-group "$RESOURCE_GROUP" \
+            --template-file infra/bicep/main.bicep \
+            --parameters \
+              environmentName="$ENVIRONMENT_NAME" \
+              registryName="$REGISTRY_NAME" \
+              deployApps=true \
+              apiImage="$API_IMAGE" \
+              webImage="$WEB_IMAGE" \
+              frontendOrigin="$FRONTEND_ORIGIN" \
+              authAuthority="$AUTHORITY" \
+              authAudience="$AUDIENCE" \
+            --only-show-errors
+      - name: Verify health, authenticated access, proxy, and SSE
+        env:
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          ENVIRONMENT_NAME: ${{ vars.NOVALABMCP_ENVIRONMENT_NAME }}
+          AUDIENCE: ${{ vars.ENTRA_API_AUDIENCE }}
+        run: |
+          set -euo pipefail
+          api_app="${ENVIRONMENT_NAME}-api"
+          web_app="${ENVIRONMENT_NAME}-web"
+          api_url="https://$(az containerapp show --name "$api_app" --resource-group "$RESOURCE_GROUP" --query properties.configuration.ingress.fqdn --output tsv)"
+          web_url="https://$(az containerapp show --name "$web_app" --resource-group "$RESOURCE_GROUP" --query properties.configuration.ingress.fqdn --output tsv)"
+          for endpoint in /health/live /health/ready; do
+            curl --fail --retry 20 --retry-delay 5 --retry-connrefused "$api_url$endpoint"
+          done
+          curl --fail --retry 20 --retry-delay 5 --retry-connrefused "$web_url/"
+          status="$(curl --silent --output /dev/null --write-out '%{http_code}' "$api_url/api/v1/scenarios")"
+          test "$status" = 401
+          token="$(az account get-access-token --resource "$AUDIENCE" --query accessToken --output tsv)"
+          curl --fail --oauth2-bearer "$token" "$api_url/api/v1/scenarios"
+          curl --fail --oauth2-bearer "$token" "$web_url/api/v1/scenarios"
+          stream_status="$(curl --silent --max-time 2 --output /dev/null --write-out '%{http_code}' \
+            --oauth2-bearer "$token" "$api_url/api/v1/mcp-activity/stream" || true)"
+          test "$stream_status" = 200

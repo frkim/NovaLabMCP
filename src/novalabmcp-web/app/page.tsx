@@ -36,6 +36,7 @@ import {
   type GridSortModel,
 } from "@mui/x-data-grid";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useAuth } from "./providers";
 
 type ScenarioId = "itsm" | "crm" | "projects";
 type RecordData = Record<string, unknown> & { id: string };
@@ -62,7 +63,9 @@ type ActivityEvent = {
   errorCode?: string;
 };
 
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:5000";
+const API =
+  process.env.NEXT_PUBLIC_API_URL ??
+  (process.env.NODE_ENV === "development" ? "http://localhost:5290" : "");
 const SCENARIOS: Record<
   ScenarioId,
   { label: string; caption: string; entities: string[] }
@@ -157,6 +160,16 @@ async function responseMessage(response: Response) {
 
 export default function Home() {
   const theme = useTheme();
+  const {
+    enabled: entraEnabled,
+    ready: authReady,
+    account,
+    roles: entraRoles,
+    error: authError,
+    getAccessToken,
+    signIn,
+    signOut,
+  } = useAuth();
   const [scenario, setScenario] = useState<ScenarioId>("itsm");
   const [entity, setEntity] = useState("tickets");
   const [role, setRole] = useState("DemoEditor");
@@ -188,12 +201,27 @@ export default function Home() {
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const abortStream = useRef<AbortController | null>(null);
   const isActivity = entity === "mcp-activity";
-  const canWrite = role === "DemoEditor" || role === "DemoAdmin";
+  const canAdmin = entraEnabled
+    ? entraRoles.includes("DemoAdmin")
+    : role === "DemoAdmin";
+  const canWrite = entraEnabled
+    ? canAdmin || entraRoles.includes("DemoEditor")
+    : role === "DemoEditor" || canAdmin;
 
   const requestHeaders = useMemo(
-    () => ({ "Content-Type": "application/json", "X-Demo-Role": role }),
-    [role],
+    () => ({
+      "Content-Type": "application/json",
+      ...(!entraEnabled ? { "X-Demo-Role": role } : {}),
+    }),
+    [entraEnabled, role],
   );
+  const getRequestHeaders = useCallback(async () => {
+    const token = await getAccessToken();
+    return {
+      ...requestHeaders,
+      ...(token ? { Authorization: ["Bearer", token].join(" ") } : {}),
+    };
+  }, [getAccessToken, requestHeaders]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => setDebouncedQuery(query), 300);
@@ -201,7 +229,7 @@ export default function Home() {
   }, [query]);
 
   const loadRecords = useCallback(async () => {
-    if (isActivity) return;
+    if (isActivity || (entraEnabled && (!authReady || !account))) return;
     setLoading(true);
     setError("");
     const parameters = new URLSearchParams({
@@ -223,7 +251,7 @@ export default function Home() {
     try {
       const response = await fetch(
         `${API}/api/v1/${scenario}/${entity}?${parameters}`,
-        { headers: requestHeaders },
+        { headers: await getRequestHeaders() },
       );
       if (!response.ok) throw new Error(await responseMessage(response));
       const data = (await response.json()) as PageResult;
@@ -243,9 +271,12 @@ export default function Home() {
   }, [
     debouncedQuery,
     entity,
+    account,
+    authReady,
+    entraEnabled,
+    getRequestHeaders,
     isActivity,
     pageModel,
-    requestHeaders,
     scenario,
     sortModel,
     statusFilter,
@@ -264,7 +295,7 @@ export default function Home() {
   }, [scenario]);
 
   useEffect(() => {
-    if (!isActivity) {
+    if (!isActivity || (entraEnabled && (!authReady || !account))) {
       abortStream.current?.abort();
       return;
     }
@@ -279,7 +310,7 @@ export default function Home() {
           const history = await fetch(
             `${API}/api/v1/mcp-activity?page=1&pageSize=50`,
             {
-              headers: requestHeaders,
+              headers: await getRequestHeaders(),
               signal: controller.signal,
             },
           );
@@ -287,7 +318,7 @@ export default function Home() {
           const retained = (await history.json()) as { items: ActivityEvent[] };
           if (active) setActivityRows(retained.items);
           const response = await fetch(`${API}/api/v1/mcp-activity/stream`, {
-            headers: requestHeaders,
+            headers: await getRequestHeaders(),
             signal: controller.signal,
           });
           if (!response.ok || !response.body)
@@ -337,7 +368,7 @@ export default function Home() {
       controller.abort();
       setStreamStatus("Disconnected");
     };
-  }, [isActivity, paused, requestHeaders]);
+  }, [account, authReady, entraEnabled, getRequestHeaders, isActivity, paused]);
 
   const columns = useMemo<GridColDef<RecordData>[]>(() => {
     const fields =
@@ -423,7 +454,7 @@ export default function Home() {
         : `${API}/api/v1/${scenario}/${entity}`;
       const response = await fetch(url, {
         method: editing ? "PATCH" : "POST",
-        headers: requestHeaders,
+        headers: await getRequestHeaders(),
         body: JSON.stringify(payload),
       });
       if (!response.ok) throw new Error(await responseMessage(response));
@@ -446,7 +477,7 @@ export default function Home() {
         `${API}/api/v1/${scenario}/${entity}/${encodeURIComponent(deleteTarget.id)}?confirm=true`,
         {
           method: "DELETE",
-          headers: requestHeaders,
+          headers: await getRequestHeaders(),
         },
       );
       if (!response.ok) throw new Error(await responseMessage(response));
@@ -467,7 +498,7 @@ export default function Home() {
     try {
       const response = await fetch(`${API}/api/v1/demo/reset`, {
         method: "POST",
-        headers: requestHeaders,
+        headers: await getRequestHeaders(),
       });
       if (!response.ok) throw new Error(await responseMessage(response));
       setSuccess("Seed data and MCP activity were reset.");
@@ -662,20 +693,36 @@ export default function Home() {
                 Enterprise operations workspace
               </Typography>
             </Box>
-            <FormControl size="small" sx={{ minWidth: 145 }}>
-              <InputLabel id="role-label">Demo role</InputLabel>
-              <Select
-                labelId="role-label"
-                label="Demo role"
-                value={role}
-                onChange={(event) => setRole(event.target.value)}
-              >
-                <MenuItem value="DemoViewer">Viewer</MenuItem>
-                <MenuItem value="DemoEditor">Editor</MenuItem>
-                <MenuItem value="DemoAdmin">Admin</MenuItem>
-              </Select>
-            </FormControl>
-            {role === "DemoAdmin" && (
+            {entraEnabled ? (
+              <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+                {account && (
+                  <Typography variant="body2">
+                    {account.name ?? account.username}
+                  </Typography>
+                )}
+                <Button
+                  onClick={() => void (account ? signOut() : signIn())}
+                  disabled={!authReady}
+                >
+                  {account ? "Sign out" : "Sign in"}
+                </Button>
+              </Box>
+            ) : (
+              <FormControl size="small" sx={{ minWidth: 145 }}>
+                <InputLabel id="role-label">Demo role</InputLabel>
+                <Select
+                  labelId="role-label"
+                  label="Demo role"
+                  value={role}
+                  onChange={(event) => setRole(event.target.value)}
+                >
+                  <MenuItem value="DemoViewer">Viewer</MenuItem>
+                  <MenuItem value="DemoEditor">Editor</MenuItem>
+                  <MenuItem value="DemoAdmin">Admin</MenuItem>
+                </Select>
+              </FormControl>
+            )}
+            {canAdmin && (
               <Button color="warning" onClick={() => void resetDemo()}>
                 Reset demo
               </Button>
@@ -694,6 +741,18 @@ export default function Home() {
         </AppBar>
 
         <Box sx={{ p: { xs: 2, md: 4 }, maxWidth: 1600, mx: "auto" }}>
+          {entraEnabled && !account && (
+            <Alert severity="info" sx={{ mb: 3 }}>
+              {authReady
+                ? "Sign in with your organization account to access NovaLabMCP."
+                : "Connecting to Microsoft Entra ID…"}
+            </Alert>
+          )}
+          {authError && (
+            <Alert severity="error" sx={{ mb: 3 }}>
+              {authError}
+            </Alert>
+          )}
           <Stack
             direction={{ xs: "column", sm: "row" }}
             spacing={2}
