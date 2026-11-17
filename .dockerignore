@@ -1,0 +1,11 @@
+.git
+.github
+**/node_modules
+**/.next
+**/bin
+**/obj
+**/coverage
+**/TestResults
+**/tsconfig.tsbuildinfo
+**/*.user
+**/*.suo
