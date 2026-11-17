@@ -104,7 +104,7 @@ as MCP commands.
 
 ## Deployment
 
-Azure Container Apps infrastructure and GitHub Actions use OIDC federation;
-the workflow intentionally does not use a long-lived `AZURE_CREDENTIALS`
-secret. See [deployment instructions](docs/deployment.md) for the required
-Azure/GitHub configuration and deployment limitations.
+Azure Container Apps infrastructure is deployed through GitHub Actions using
+the `AZURE_CREDENTIALS` environment secret. See
+[deployment instructions](docs/deployment.md) for the required Azure/GitHub
+configuration and deployment limitations.
