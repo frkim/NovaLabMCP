@@ -1,9 +1,9 @@
 # Azure Container Apps deployment
 
-The deployment uses GitHub OIDC federation; it deliberately does **not** use a
-long-lived `AZURE_CREDENTIALS` JSON secret. No Azure deployment has been run
-from this repository clone. Complete the one-time setup below in a dedicated
-resource group before enabling the protected GitHub environment.
+The deployment uses the `AZURE_CREDENTIALS` GitHub Actions secret to sign in
+to Azure. No Azure deployment has been run from this repository clone.
+Complete the one-time setup below in a dedicated resource group before
+enabling the protected GitHub environment.
 
 ## What is provisioned
 
@@ -24,16 +24,16 @@ availability: deployments and restarts reset in-memory records and activity.
 
 ## One-time bootstrap
 
-1. Create a dedicated resource group and an Azure app/service principal for the
-   GitHub deployment identity. Create a federated credential with:
-   - issuer: `https://token.actions.githubusercontent.com`
-   - subject: `repo:frkim/NovaLabMCP:environment:production`
-   - audience: `api://AzureADTokenExchange`
-2. The deployment identity needs Contributor on only the dedicated resource
-   group and `AcrPush` on the created registry. An administrator performing
-   bootstrap needs permission to create managed identities and role
-   assignments. Do not grant the workflow identity subscription-wide Owner.
-3. Bootstrap the registry and runtime environment, with no image reference:
+1. Create a dedicated resource group and an Azure service principal for the
+   GitHub deployment identity. Store its Azure Login JSON credential as the
+   `AZURE_CREDENTIALS` secret in the GitHub `production` environment. Do not
+   commit or print the credential. The JSON must contain `clientId`,
+   `clientSecret`, `subscriptionId`, and `tenantId`. The deployment identity
+   needs Contributor on only the dedicated resource group and `AcrPush` on
+   the created registry. An administrator performing bootstrap needs
+   permission to create managed identities and role assignments. Do not
+   grant the workflow identity subscription-wide Owner.
+2. Bootstrap the registry and runtime environment, with no image reference:
 
    ```bash
    az deployment group create \
@@ -45,16 +45,16 @@ availability: deployments and restarts reset in-memory records and activity.
        deployApps=false
    ```
 
-4. Allow the two app managed identities' `AcrPull` assignments to propagate
+3. Allow the two app managed identities' `AcrPull` assignments to propagate
    before the first app deployment. The GitHub identity also needs `AcrPush`
    on the registry.
-5. Create Entra app registrations for the API and SPA. Expose a delegated API
+4. Create Entra app registrations for the API and SPA. Expose a delegated API
    scope, register the frontend URL as an SPA redirect URI, and define the
    `DemoViewer`, `DemoEditor`, and `DemoAdmin` app roles. Assign the appropriate
    roles to users and to the GitHub smoke-test service principal. The frontend
    requests the configured API scope; the API validates its configured
    authority and audience and uses the `roles` claim.
-6. Get the Container Apps environment's default domain and determine the
+5. Get the Container Apps environment's default domain and determine the
    expected HTTPS app origins:
 
    ```bash
@@ -67,10 +67,9 @@ availability: deployments and restarts reset in-memory records and activity.
    The names are `${NOVALABMCP_ENVIRONMENT_NAME}-api` and
    `${NOVALABMCP_ENVIRONMENT_NAME}-web`; the API Bicep output also returns both
    HTTPS URLs after deployment.
-7. Configure the GitHub `production` environment with reviewers/protection
-   rules and these **variables** (client IDs and endpoint URLs are identifiers,
-   not credentials):
-   - `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`
+6. Configure the GitHub `production` environment with reviewers/protection
+   rules, the `AZURE_CREDENTIALS` secret, and these **variables** (client IDs
+   and endpoint URLs are identifiers, not credentials):
    - `AZURE_RESOURCE_GROUP`
    - `NOVALABMCP_ENVIRONMENT_NAME`, `NOVALABMCP_REGISTRY_NAME`
    - `NOVALABMCP_FRONTEND_ORIGIN` (exact `https://...` frontend URL)
@@ -78,9 +77,6 @@ availability: deployments and restarts reset in-memory records and activity.
      `https://login.microsoftonline.com/<tenant-id>/v2.0`)
    - `ENTRA_API_AUDIENCE`, `ENTRA_CLIENT_ID`, `ENTRA_TENANT_ID`,
      `ENTRA_API_SCOPE` (for example `api://<api-client-id>/access_as_user`)
-
-   Set the GitHub OIDC federated credential subject to the protected
-   environment. No client secret or `AZURE_CREDENTIALS` secret is required.
 
 ## Deploy and verify
 
@@ -90,12 +86,15 @@ smoke-tests REST and MCP for each scenario, validates Bicep, and builds both
 images without Azure credentials.
 
 To deploy, manually dispatch the workflow from `main`, set `deploy=true`, and
-approve the `production` environment. The deploy job signs in with OIDC,
-publishes commit-tagged images, resolves their ACR digests, and deploys the
-exact digest references. It then verifies API and frontend health, confirms
+approve the `production` environment. The deploy job signs in using the
+`AZURE_CREDENTIALS` secret, publishes commit-tagged images, resolves their ACR
+digests, and deploys the exact digest references. It then verifies API and
+frontend health, confirms
 unauthenticated REST access is rejected, obtains an API token for the
 deployment identity, verifies direct and frontend-proxied authenticated access,
 and checks the protected SSE stream.
+After successful verification, the workflow run summary lists the frontend and
+API URLs.
 
 The smoke check requires the deployment principal to be assigned the API's
 `DemoViewer` app role. Authentication configuration must be valid; deployment
@@ -118,4 +117,3 @@ print them in logs.
   this demo. Then run `az group delete --name "$AZURE_RESOURCE_GROUP"` and
   confirm the interactive prompt. This deletes every resource in that group;
   never select a shared or unrelated resource group.
-
