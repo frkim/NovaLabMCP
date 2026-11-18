@@ -64,7 +64,9 @@ if (!demoAuthEnabled)
 {
     app.UseAuthentication();
 }
+#pragma warning disable ASP0001 // The main app uses minimal endpoint mappings; UseEndpoints is only used by the isolated MCP app.
 app.UseAuthorization();
+#pragma warning restore ASP0001
 
 app.Use(async (context, next) =>
 {
