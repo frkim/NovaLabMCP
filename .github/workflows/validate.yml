@@ -47,12 +47,19 @@ jobs:
               --project src/NovaLabMCP.Api > /tmp/novalabmcp-api.log 2>&1 &
           api_pid=$!
           trap 'kill "$api_pid" 2>/dev/null || true' EXIT
+          api_ready=false
           for attempt in $(seq 1 30); do
             if curl --silent --fail http://localhost:5290/health/live >/dev/null; then
+              api_ready=true
               break
             fi
             sleep 1
           done
+          if [ "$api_ready" != true ]; then
+            echo "API failed to become ready within 30 seconds; startup log follows:"
+            cat /tmp/novalabmcp-api.log
+            exit 1
+          fi
           bash tests/smoke-test.sh
       - name: Lint, type-check, audit, and build frontend
         working-directory: src/novalabmcp-web
