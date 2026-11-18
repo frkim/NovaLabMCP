@@ -12,13 +12,31 @@ on:
         type: boolean
         required: true
         default: false
+      resource_group:
+        description: Azure resource group (overrides AZURE_RESOURCE_GROUP)
+        type: string
+      environment_name:
+        description: Bootstrap prefix (overrides NOVALABMCP_ENVIRONMENT_NAME)
+        type: string
+      registry_name:
+        description: Azure Container Registry name (overrides NOVALABMCP_REGISTRY_NAME)
+        type: string
+      entra_client_id:
+        description: Entra SPA application ID (overrides ENTRA_CLIENT_ID)
+        type: string
+      entra_api_scope:
+        description: Entra delegated API scope (overrides ENTRA_API_SCOPE)
+        type: string
+      entra_api_audience:
+        description: Entra API application ID (overrides ENTRA_API_AUDIENCE)
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: novalabmcp-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: novalabmcp-${{ github.workflow }}-${{ github.ref }}-${{ inputs.deploy && 'release' || 'checks' }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' || !inputs.deploy }}
 
 jobs:
   validate:
@@ -75,8 +93,10 @@ jobs:
         run: |
           az bicep install
           az bicep build --file infra/bicep/main.bicep --outfile /tmp/novalabmcp-main.json
+          az bicep build --file infra/bicep/apps.bicep --outfile /tmp/novalabmcp-apps.json
 
   build-images:
+    if: github.event_name != 'workflow_dispatch' || !inputs.deploy || github.ref != 'refs/heads/main'
     needs: validate
     runs-on: ubuntu-latest
     steps:
@@ -97,9 +117,7 @@ jobs:
 
   deploy:
     if: github.event_name == 'workflow_dispatch' && inputs.deploy == true && github.ref == 'refs/heads/main'
-    needs:
-      - validate
-      - build-images
+    needs: validate
     runs-on: ubuntu-latest
     environment: production
     permissions:
@@ -107,26 +125,62 @@ jobs:
     concurrency:
       group: novalabmcp-production
       cancel-in-progress: false
+    env:
+      RESOURCE_GROUP: ${{ inputs.resource_group || vars.AZURE_RESOURCE_GROUP }}
+      ENVIRONMENT_NAME: ${{ inputs.environment_name || vars.NOVALABMCP_ENVIRONMENT_NAME }}
+      REGISTRY_NAME: ${{ inputs.registry_name || vars.NOVALABMCP_REGISTRY_NAME }}
+      CLIENT_ID: ${{ inputs.entra_client_id || vars.ENTRA_CLIENT_ID }}
+      API_SCOPE: ${{ inputs.entra_api_scope || vars.ENTRA_API_SCOPE }}
+      AUDIENCE: ${{ inputs.entra_api_audience || vars.ENTRA_API_AUDIENCE }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Check deployment settings
+        run: bash infra/check-deployment-settings.sh
       - name: Sign in to Azure
         uses: Azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Check Azure targets and API token
+        id: azure
+        run: |
+          set -euo pipefail
+          tenant_id="$(az account show --query tenantId --output tsv)"
+          auth_scope="${API_SCOPE%/*}/.default"
+          login_server="$(az acr show --resource-group "$RESOURCE_GROUP" --name "$REGISTRY_NAME" \
+            --query loginServer --output tsv)"
+          app_location="$(az containerapp env show --resource-group "$RESOURCE_GROUP" --name "${ENVIRONMENT_NAME}-aca" \
+            --query location --output tsv)"
+          test -n "$app_location"
+          test -n "$login_server"
+          for component in api web; do
+            az identity show --resource-group "$RESOURCE_GROUP" --name "${ENVIRONMENT_NAME}-${component}-pull" --output none
+          done
+          az account get-access-token --scope "$auth_scope" --query accessToken --output tsv |
+            node -e '
+              const token = require("node:fs").readFileSync(0, "utf8").trim();
+              if (!token) throw new Error("No API token received");
+              const claims = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf8"));
+              if (claims.aud !== process.env.AUDIENCE || claims.ver !== "2.0") {
+                throw new Error("Configure the API registration to issue v2 tokens with ENTRA_API_AUDIENCE as the audience");
+              }
+              if (!claims.roles?.includes("DemoViewer")) throw new Error("Assign the API DemoViewer app role to the deployment principal");
+            '
+          {
+            echo "tenant_id=$tenant_id"
+            echo "login_server=$login_server"
+            echo "app_location=$app_location"
+          } >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build and push immutable images
         id: images
         env:
-          REGISTRY_NAME: ${{ vars.NOVALABMCP_REGISTRY_NAME }}
-          CLIENT_ID: ${{ vars.ENTRA_CLIENT_ID }}
-          TENANT_ID: ${{ vars.ENTRA_TENANT_ID }}
-          API_SCOPE: ${{ vars.ENTRA_API_SCOPE }}
+          TENANT_ID: ${{ steps.azure.outputs.tenant_id }}
+          LOGIN_SERVER: ${{ steps.azure.outputs.login_server }}
         run: |
           set -euo pipefail
-          login_server="$(az acr show --name "$REGISTRY_NAME" --query loginServer --output tsv)"
           az acr login --name "$REGISTRY_NAME"
-          api_tag="${login_server}/novalabmcp-api:${GITHUB_SHA}"
-          web_tag="${login_server}/novalabmcp-web:${GITHUB_SHA}"
+          api_tag="${LOGIN_SERVER}/novalabmcp-api:${GITHUB_SHA}"
+          web_tag="${LOGIN_SERVER}/novalabmcp-web:${GITHUB_SHA}"
           docker buildx build --push --file src/NovaLabMCP.Api/Dockerfile --tag "$api_tag" .
           docker buildx build --push \
             --file src/novalabmcp-web/Dockerfile \
@@ -136,58 +190,52 @@ jobs:
             --tag "$web_tag" src/novalabmcp-web
           api_digest="$(az acr repository show --name "$REGISTRY_NAME" --image "novalabmcp-api:${GITHUB_SHA}" --query digest --output tsv)"
           web_digest="$(az acr repository show --name "$REGISTRY_NAME" --image "novalabmcp-web:${GITHUB_SHA}" --query digest --output tsv)"
-          echo "api_image=${login_server}/novalabmcp-api@${api_digest}" >> "$GITHUB_OUTPUT"
-          echo "web_image=${login_server}/novalabmcp-web@${web_digest}" >> "$GITHUB_OUTPUT"
+          echo "api_image=${LOGIN_SERVER}/novalabmcp-api@${api_digest}" >> "$GITHUB_OUTPUT"
+          echo "web_image=${LOGIN_SERVER}/novalabmcp-web@${web_digest}" >> "$GITHUB_OUTPUT"
       - name: Deploy single-revision Container Apps
+        id: apps
         env:
-          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
-          ENVIRONMENT_NAME: ${{ vars.NOVALABMCP_ENVIRONMENT_NAME }}
-          REGISTRY_NAME: ${{ vars.NOVALABMCP_REGISTRY_NAME }}
-          FRONTEND_ORIGIN: ${{ vars.NOVALABMCP_FRONTEND_ORIGIN }}
-          AUTHORITY: ${{ vars.NOVALABMCP_AUTHORITY }}
-          AUDIENCE: ${{ vars.ENTRA_API_AUDIENCE }}
+          TENANT_ID: ${{ steps.azure.outputs.tenant_id }}
+          APP_LOCATION: ${{ steps.azure.outputs.app_location }}
           API_IMAGE: ${{ steps.images.outputs.api_image }}
           WEB_IMAGE: ${{ steps.images.outputs.web_image }}
         run: |
           set -euo pipefail
-          az deployment group create \
+          outputs="$(az deployment group create \
             --resource-group "$RESOURCE_GROUP" \
-            --template-file infra/bicep/main.bicep \
+            --template-file infra/bicep/apps.bicep \
             --parameters \
               environmentName="$ENVIRONMENT_NAME" \
+              location="$APP_LOCATION" \
               registryName="$REGISTRY_NAME" \
-              deployApps=true \
               apiImage="$API_IMAGE" \
               webImage="$WEB_IMAGE" \
-              frontendOrigin="$FRONTEND_ORIGIN" \
-              authAuthority="$AUTHORITY" \
+              authAuthority="https://login.microsoftonline.com/${TENANT_ID}/v2.0" \
               authAudience="$AUDIENCE" \
-            --only-show-errors
+            --query properties.outputs --output json --only-show-errors)"
+          jq -er '"api_url=\(.apiUrl.value)\nweb_url=\(.webUrl.value)"' <<< "$outputs" >> "$GITHUB_OUTPUT"
       - name: Verify health, authenticated access, proxy, and SSE
         env:
-          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
-          ENVIRONMENT_NAME: ${{ vars.NOVALABMCP_ENVIRONMENT_NAME }}
-          AUDIENCE: ${{ vars.ENTRA_API_AUDIENCE }}
+          API_URL: ${{ steps.apps.outputs.api_url }}
+          WEB_URL: ${{ steps.apps.outputs.web_url }}
         run: |
           set -euo pipefail
-          api_app="${ENVIRONMENT_NAME}-api"
-          web_app="${ENVIRONMENT_NAME}-web"
-          api_url="https://$(az containerapp show --name "$api_app" --resource-group "$RESOURCE_GROUP" --query properties.configuration.ingress.fqdn --output tsv)"
-          web_url="https://$(az containerapp show --name "$web_app" --resource-group "$RESOURCE_GROUP" --query properties.configuration.ingress.fqdn --output tsv)"
+          read_endpoint=/api/v1/itsm/tickets
           for endpoint in /health/live /health/ready; do
-            curl --fail --retry 20 --retry-delay 5 --retry-connrefused "$api_url$endpoint"
+            curl --fail --retry 20 --retry-delay 5 --retry-connrefused "$API_URL$endpoint"
           done
-          curl --fail --retry 20 --retry-delay 5 --retry-connrefused "$web_url/"
-          status="$(curl --silent --output /dev/null --write-out '%{http_code}' "$api_url/api/v1/scenarios")"
+          curl --fail --retry 20 --retry-delay 5 --retry-connrefused --output /dev/null "$WEB_URL/"
+          status="$(curl --silent --output /dev/null --write-out '%{http_code}' "$API_URL$read_endpoint")"
           test "$status" = 401
-          token="$(az account get-access-token --resource "$AUDIENCE" --query accessToken --output tsv)"
-          curl --fail --oauth2-bearer "$token" "$api_url/api/v1/scenarios"
-          curl --fail --oauth2-bearer "$token" "$web_url/api/v1/scenarios"
+          token="$(az account get-access-token --scope "${API_SCOPE%/*}/.default" --query accessToken --output tsv)"
+          echo "::add-mask::$token"
+          curl --fail --header "Authorization: Bearer $token" --output /dev/null "$API_URL$read_endpoint"
+          curl --fail --header "Authorization: Bearer $token" --output /dev/null "$WEB_URL$read_endpoint"
           stream_status="$(curl --silent --max-time 2 --output /dev/null --write-out '%{http_code}' \
-            --oauth2-bearer "$token" "$api_url/api/v1/mcp-activity/stream" || true)"
+            --header "Authorization: Bearer $token" "$API_URL/api/v1/mcp-activity/stream" || true)"
           test "$stream_status" = 200
           {
             echo "## Deployment URLs"
-            echo "- Frontend: $web_url"
-            echo "- API: $api_url"
+            echo "- Frontend: $WEB_URL"
+            echo "- API: $API_URL"
           } >> "$GITHUB_STEP_SUMMARY"
